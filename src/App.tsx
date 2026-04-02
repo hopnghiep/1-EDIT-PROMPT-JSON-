@@ -48,6 +48,76 @@ import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI, Type } from "@google/genai";
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { 
+  auth, 
+  db, 
+  googleProvider, 
+  signInWithPopup, 
+  signOut, 
+  onAuthStateChanged, 
+  FirebaseUser, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  collection, 
+  query, 
+  where, 
+  onSnapshot, 
+  updateDoc, 
+  deleteDoc, 
+  addDoc, 
+  serverTimestamp,
+  OperationType,
+  handleFirestoreError,
+  Timestamp
+} from './firebase';
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "Đã có lỗi xảy ra. Vui lòng thử lại.";
+      try {
+        const parsedError = JSON.parse(this.state.error.message);
+        if (parsedError.error) {
+          errorMessage = `Lỗi Firestore (${parsedError.operationType}): ${parsedError.error}`;
+        }
+      } catch (e) {
+        errorMessage = this.state.error?.message || errorMessage;
+      }
+
+      return (
+        <div className="min-h-screen bg-[#F5F5F0] flex items-center justify-center p-4">
+          <div className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full text-center space-y-4">
+            <AlertCircle className="w-16 h-16 text-red-500 mx-auto" />
+            <h2 className="text-2xl font-serif italic text-black">Rất tiếc, đã có lỗi xảy ra</h2>
+            <p className="text-black/60 text-sm">{errorMessage}</p>
+            <button 
+              onClick={() => window.location.reload()} 
+              className="w-full py-3 bg-black text-white rounded-xl font-bold hover:opacity-80 transition-all"
+            >
+              Tải lại trang
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 const withRetry = async <T,>(fn: () => Promise<T>, maxRetries = 3, delayMs = 2000): Promise<T> => {
   let lastError: any;
@@ -814,6 +884,13 @@ function ColorEditorModal({
 }
 
 export default function App() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [projects, setProjects] = useState<any[]>([]);
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+  const [isProjectListOpen, setIsProjectListOpen] = useState(false);
+  const [isSavingProject, setIsSavingProject] = useState(false);
+
   const [samples, setSamples] = useState<(PromptParts & { title: string; isCustom?: boolean })[]>([]);
   const { parts, architectureJson, setParts, setArchitectureJson, undo, redo, canUndo, canRedo } = useAppHistory(INITIAL_PARTS, null);
   const [improvedPrompt, setImprovedPrompt] = useState('');
@@ -878,6 +955,123 @@ export default function App() {
   const [isDraggingMain, setIsDraggingMain] = useState(false);
   const [isDraggingRef, setIsDraggingRef] = useState(false);
   const [hasApiKey, setHasApiKey] = useState<boolean>(true);
+
+  // Firebase Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      setAuthLoading(false);
+      if (currentUser) {
+        // Sync user profile
+        const userDoc = doc(db, 'users', currentUser.uid);
+        try {
+          await setDoc(userDoc, {
+            uid: currentUser.uid,
+            email: currentUser.email,
+            displayName: currentUser.displayName,
+            photoURL: currentUser.photoURL,
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+        } catch (e) {
+          handleFirestoreError(e, OperationType.WRITE, `users/${currentUser.uid}`);
+        }
+      } else {
+        setProjects([]);
+        setCurrentProjectId(null);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Sync Projects List
+  useEffect(() => {
+    if (!user) return;
+    const q = query(collection(db, 'projects'), where('ownerUid', '==', user.uid));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const projectList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProjects(projectList);
+    }, (e) => {
+      handleFirestoreError(e, OperationType.LIST, 'projects');
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  // Sync Current Project Data
+  useEffect(() => {
+    if (!user || !currentProjectId) return;
+    const projectDoc = doc(db, 'projects', currentProjectId);
+    const unsubscribe = onSnapshot(projectDoc, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        if (data.parts) setParts(data.parts);
+        if (data.improvedPrompt) setImprovedPrompt(data.improvedPrompt);
+        if (data.finalPrompt) setFinalPrompt(data.finalPrompt);
+        if (data.architectureJson) setArchitectureJson(data.architectureJson);
+        if (data.annotations) setAnnotations(data.annotations);
+        if (data.uploadedImages) setUploadedImages(data.uploadedImages);
+        if (data.referenceImage) setReferenceImage(data.referenceImage);
+        if (data.history) setHistory(data.history);
+      }
+    }, (e) => {
+      handleFirestoreError(e, OperationType.GET, `projects/${currentProjectId}`);
+    });
+    return () => unsubscribe();
+  }, [user, currentProjectId]);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      console.error("Login failed", e);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.error("Logout failed", e);
+    }
+  };
+
+  const saveCurrentProject = async (name?: string) => {
+    if (!user) return;
+    setIsSavingProject(true);
+    try {
+      const projectData = {
+        ownerUid: user.uid,
+        name: name || (currentProjectId ? projects.find(p => p.id === currentProjectId)?.name : 'Dự án mới'),
+        parts,
+        improvedPrompt,
+        finalPrompt,
+        architectureJson,
+        annotations,
+        uploadedImages,
+        referenceImage,
+        history,
+        updatedAt: serverTimestamp()
+      };
+
+      if (currentProjectId) {
+        await updateDoc(doc(db, 'projects', currentProjectId), projectData);
+      } else {
+        const docRef = await addDoc(collection(db, 'projects'), {
+          ...projectData,
+          createdAt: serverTimestamp()
+        });
+        setCurrentProjectId(docRef.id);
+      }
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, currentProjectId ? `projects/${currentProjectId}` : 'projects');
+    } finally {
+      setIsSavingProject(false);
+    }
+  };
+
+  const createNewProject = () => {
+    setCurrentProjectId(null);
+    handleReset();
+  };
   const [isViewingPromptIdea, setIsViewingPromptIdea] = useState(false);
   const [isViewingJsonIdea, setIsViewingJsonIdea] = useState(false);
   const [isViewingJson, setIsViewingJson] = useState(false);
@@ -2516,71 +2710,126 @@ Chỉ trả về chuỗi JSON hợp lệ, không có markdown hay giải thích 
     );
   }
 
-  return (
-    <div className="min-h-screen bg-[#F5F5F0] text-black font-sans selection:bg-[#5A5A40] selection:text-white">
-      {/* Header */}
-      <header className="border-b border-black/10 bg-white/50 backdrop-blur-md sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-[#5A5A40] rounded-lg flex items-center justify-center">
-              <Sparkles className="text-white w-5 h-5" />
-            </div>
-            <h1 className="text-xl font-semibold tracking-tight text-black">PromptCraft AI</h1>
-          </div>
-          <div className="flex items-center gap-4">
-            <button 
-              onClick={() => importFileInputRef.current?.click()}
-              className="text-sm font-medium text-black hover:opacity-70 flex items-center gap-1 transition-colors"
-              title="Nhập dữ liệu"
-            >
-              <Upload className="w-4 h-4" />
-              <span className="hidden sm:inline">Nhập</span>
-            </button>
-            <input 
-              type="file"
-              ref={importFileInputRef}
-              onChange={handleImport}
-              accept=".json"
-              className="hidden"
-            />
-            <button 
-              onClick={handleExport}
-              className="text-sm font-medium text-black hover:opacity-70 flex items-center gap-1 transition-colors"
-              title="Xuất dữ liệu"
-            >
-              <Download className="w-4 h-4" />
-              <span className="hidden sm:inline">Xuất</span>
-            </button>
-            <div className="w-px h-4 bg-black/20 mx-1"></div>
-            <button 
-              onClick={undo}
-              disabled={!canUndo}
-              className={`text-sm font-medium flex items-center gap-1 transition-colors ${canUndo ? 'text-black hover:opacity-70' : 'text-black/30 cursor-not-allowed'}`}
-              title="Hoàn tác (Undo)"
-            >
-              <Undo className="w-4 h-4" />
-            </button>
-            <button 
-              onClick={redo}
-              disabled={!canRedo}
-              className={`text-sm font-medium flex items-center gap-1 transition-colors ${canRedo ? 'text-black hover:opacity-70' : 'text-black/30 cursor-not-allowed'}`}
-              title="Làm lại (Redo)"
-            >
-              <Redo className="w-4 h-4" />
-            </button>
-            <div className="w-px h-4 bg-black/20 mx-1"></div>
-            <button 
-              onClick={handleReset}
-              className="text-sm font-medium text-black hover:opacity-70 flex items-center gap-1 transition-colors"
-            >
-              <Trash2 className="w-4 h-4" />
-              <span className="hidden sm:inline">Làm mới</span>
-            </button>
-          </div>
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#F5F5F0] flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-[#5A5A40] border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm font-medium text-black/40">Đang khởi tạo...</p>
         </div>
-      </header>
+      </div>
+    );
+  }
 
-      <main className="max-w-[1600px] mx-auto px-6 py-12 grid grid-cols-1 lg:grid-cols-12 gap-8">
+  return (
+    <ErrorBoundary>
+      <div className="min-h-screen bg-[#F5F5F0] text-black font-sans selection:bg-[#5A5A40] selection:text-white">
+        {/* Header */}
+        <header className="border-b border-black/10 bg-white/50 backdrop-blur-md sticky top-0 z-50">
+          <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div className="flex items-center gap-6">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 bg-[#5A5A40] rounded-lg flex items-center justify-center">
+                  <Sparkles className="text-white w-5 h-5" />
+                </div>
+                <h1 className="text-xl font-semibold tracking-tight text-black">PromptCraft AI</h1>
+              </div>
+
+              {user && (
+                <div className="hidden md:flex items-center gap-2">
+                  <div className="w-px h-6 bg-black/10 mx-2" />
+                  <button 
+                    onClick={() => setIsProjectListOpen(true)}
+                    className="flex items-center gap-2 px-3 py-1.5 bg-black/5 hover:bg-black/10 rounded-xl transition-all text-sm font-medium"
+                  >
+                    <FileText className="w-4 h-4" />
+                    {currentProjectId ? projects.find(p => p.id === currentProjectId)?.name : 'Chọn dự án'}
+                    <ChevronDown className="w-4 h-4" />
+                  </button>
+                  <button 
+                    onClick={() => saveCurrentProject()}
+                    disabled={isSavingProject}
+                    className="p-2 hover:bg-black/5 rounded-xl transition-all text-black/60"
+                    title="Lưu dự án"
+                  >
+                    {isSavingProject ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center gap-4">
+              {user ? (
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-2">
+                    <img src={user.photoURL || ''} alt={user.displayName || ''} className="w-8 h-8 rounded-full border border-black/10" />
+                    <div className="hidden sm:block text-right">
+                      <p className="text-xs font-bold text-black">{user.displayName}</p>
+                      <button onClick={handleLogout} className="text-[10px] text-black/40 hover:text-red-500 transition-colors">Đăng xuất</button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <button 
+                  onClick={handleLogin}
+                  className="px-4 py-2 bg-black text-white rounded-xl text-sm font-bold hover:opacity-80 transition-all flex items-center gap-2"
+                >
+                  <User className="w-4 h-4" />
+                  Đăng nhập
+                </button>
+              )}
+              
+              <div className="w-px h-6 bg-black/10 mx-1 hidden sm:block" />
+              
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={() => importFileInputRef.current?.click()}
+                  className="p-2 hover:bg-black/5 rounded-xl text-black/60 transition-colors"
+                  title="Nhập dữ liệu"
+                >
+                  <Upload className="w-4 h-4" />
+                </button>
+                <input 
+                  type="file"
+                  ref={importFileInputRef}
+                  onChange={handleImport}
+                  accept=".json"
+                  className="hidden"
+                />
+                <button 
+                  onClick={handleExport}
+                  className="p-2 hover:bg-black/5 rounded-xl text-black/60 transition-colors"
+                  title="Xuất dữ liệu"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              </div>
+              
+              <div className="w-px h-6 bg-black/10 mx-1" />
+              
+              <div className="flex items-center gap-1">
+                <button 
+                  onClick={undo}
+                  disabled={!canUndo}
+                  className="p-2 hover:bg-black/5 rounded-xl text-black/60 disabled:opacity-20 transition-all"
+                  title="Hoàn tác"
+                >
+                  <Undo className="w-4 h-4" />
+                </button>
+                <button 
+                  onClick={redo}
+                  disabled={!canRedo}
+                  className="p-2 hover:bg-black/5 rounded-xl text-black/60 disabled:opacity-20 transition-all"
+                  title="Làm lại"
+                >
+                  <Redo className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <main className="max-w-[1600px] mx-auto px-6 py-12 grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Left Column: Input Form */}
         <div className="lg:col-span-4 space-y-8">
           {/* Sample Prompts Section */}
@@ -4166,6 +4415,89 @@ Chỉ trả về chuỗi JSON hợp lệ, không có markdown hay giải thích 
           </div>
         </div>
       </footer>
+      {/* Project List Modal */}
+      <AnimatePresence>
+        {isProjectListOpen && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col max-h-[80vh]"
+            >
+              <div className="p-6 border-b border-black/10 flex items-center justify-between bg-[#F5F5F0]">
+                <h3 className="text-xl font-serif italic text-black">Dự án của bạn</h3>
+                <button onClick={() => setIsProjectListOpen(false)} className="p-2 hover:bg-black/5 rounded-full transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-4 overflow-y-auto flex-1 space-y-2">
+                <button 
+                  onClick={() => {
+                    createNewProject();
+                    setIsProjectListOpen(false);
+                  }}
+                  className="w-full p-4 border-2 border-dashed border-black/10 rounded-2xl flex items-center justify-center gap-2 text-black/40 hover:border-black/30 hover:text-black/60 transition-all"
+                >
+                  <Plus className="w-5 h-5" />
+                  <span className="font-bold">Tạo dự án mới</span>
+                </button>
+                
+                {projects.map((project) => (
+                  <div 
+                    key={project.id}
+                    className={cn(
+                      "group p-4 rounded-2xl border transition-all flex items-center justify-between cursor-pointer",
+                      currentProjectId === project.id 
+                        ? "bg-[#5A5A40]/10 border-[#5A5A40] text-black" 
+                        : "bg-white border-black/5 hover:border-black/20"
+                    )}
+                    onClick={() => {
+                      setCurrentProjectId(project.id);
+                      setIsProjectListOpen(false);
+                    }}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-black/5 rounded-xl flex items-center justify-center group-hover:bg-black/10 transition-colors">
+                        <FileText className="w-5 h-5 text-black/40" />
+                      </div>
+                      <div>
+                        <p className="font-bold text-sm">{project.name}</p>
+                        <p className="text-[10px] text-black/40">Cập nhật: {project.updatedAt?.toDate().toLocaleString()}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const newName = prompt("Nhập tên mới cho dự án:", project.name);
+                          if (newName) updateDoc(doc(db, 'projects', project.id), { name: newName });
+                        }}
+                        className="p-2 hover:bg-black/5 rounded-lg text-black/40 hover:text-black"
+                      >
+                        <Pencil className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (confirm("Xóa dự án này?")) {
+                            await deleteDoc(doc(db, 'projects', project.id));
+                            if (currentProjectId === project.id) setCurrentProjectId(null);
+                          }
+                        }}
+                        className="p-2 hover:bg-black/5 rounded-lg text-black/40 hover:text-red-500"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
+    </ErrorBoundary>
   );
 }

@@ -1,0 +1,122 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {uid}
+    // Fields:
+    //   - uid: string (required) - Firebase Auth UID
+    //   - email: string (required) - User email
+    //   - displayName: string (optional) - User display name
+    //   - photoURL: string (optional) - User photo URL
+    //   - createdAt: timestamp (required) - Account creation timestamp
+    //
+    // Collection: projects
+    // Document ID: {projectId}
+    // Fields:
+    //   - ownerUid: string (required) - UID of the owner
+    //   - name: string (required) - Project name
+    //   - parts: map (optional) - Prompt parts
+    //   - improvedPrompt: string (optional) - AI-improved prompt
+    //   - finalPrompt: string (optional) - Final prompt
+    //   - architectureJson: string (optional) - Architectural JSON
+    //   - annotations: list (optional) - Floor plan annotations
+    //   - uploadedImages: list (optional) - Base64 encoded images
+    //   - referenceImage: string (optional) - Base64 encoded reference image
+    //   - generatedImageUrl: string (optional) - Generated image URL
+    //   - history: list (optional) - Prompt history
+    //   - isPublic: bool (optional) - Whether the project is shared
+    //   - createdAt: timestamp (required) - Creation timestamp
+    //   - updatedAt: timestamp (required) - Last update timestamp
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.ownerUid;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "hopnghiep@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.uid is string && data.uid.size() > 0 &&
+             data.email is string && isValidEmail(data.email) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() < 1000));
+    }
+
+    function isValidProject(data) {
+      return data.ownerUid is string && data.ownerUid.size() > 0 &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 200 &&
+             (!('isPublic' in data) || data.isPublic is bool) &&
+             (!('improvedPrompt' in data) || (data.improvedPrompt is string && data.improvedPrompt.size() < 10000)) &&
+             (!('finalPrompt' in data) || (data.finalPrompt is string && data.finalPrompt.size() < 10000)) &&
+             (!('architectureJson' in data) || (data.architectureJson is string && data.architectureJson.size() < 100000)) &&
+             (!('annotations' in data) || (data.annotations is list && data.annotations.size() < 500)) &&
+             (!('uploadedImages' in data) || (data.uploadedImages is list && data.uploadedImages.size() < 10)) &&
+             (!('history' in data) || (data.history is list && data.history.size() < 100));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{uid} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(uid) && isValidUser(request.resource.data) && 
+                      (!('role' in request.resource.data) || isAdmin());
+      allow update: if isOwner(uid) && isValidUser(request.resource.data) && 
+                      (request.resource.data.role == resource.data.role || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow read: if isAuthenticated() && (isDocOwner() || resource.data.isPublic == true || isAdmin());
+      allow create: if isAuthenticated() && isValidProject(request.resource.data) && 
+                      (request.resource.data.ownerUid == request.auth.uid || isAdmin());
+      allow update: if isAuthenticated() && isValidProject(request.resource.data) && 
+                      (isDocOwner() || isAdmin()) &&
+                      request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isAuthenticated() && (isDocOwner() || isAdmin());
+    }
+
+    // Default deny
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
